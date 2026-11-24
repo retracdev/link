@@ -1,0 +1,17 @@
+{
+  "name": "retrac-link",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Link shortener for retrac.link, running on Cloudflare Workers + D1",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "allowScripts": {
+    "workerd@1.20261123.1": true,
+    "esbuild@0.28.2": true
+  }
+}
