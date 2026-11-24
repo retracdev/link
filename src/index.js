@@ -128,6 +128,14 @@ function ensureSchema(db) {
           )`,
         ),
         db.prepare(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`),
+        // Extra short codes that point at a link. `slug` is the link's main slug.
+        db.prepare(
+          `CREATE TABLE IF NOT EXISTS aliases (
+            alias TEXT PRIMARY KEY COLLATE NOCASE,
+            slug TEXT NOT NULL COLLATE NOCASE
+          )`,
+        ),
+        db.prepare(`CREATE INDEX IF NOT EXISTS aliases_slug ON aliases (slug)`),
       ])
       .catch((err) => {
         schemaReady = null;
@@ -141,6 +149,30 @@ function getLink(db, slug) {
   return db.prepare("SELECT * FROM links WHERE slug = ?").bind(slug).first();
 }
 
+// Finds a link by its main slug or by one of its aliases.
+async function resolveLink(db, code) {
+  return (
+    (await getLink(db, code)) ||
+    db
+      .prepare("SELECT l.* FROM aliases a JOIN links l ON l.slug = a.slug WHERE a.alias = ?")
+      .bind(code)
+      .first()
+  );
+}
+
+async function getAliases(db, slug) {
+  const { results } = await db
+    .prepare("SELECT alias FROM aliases WHERE slug = ? ORDER BY alias")
+    .bind(slug)
+    .all();
+  return results.map((r) => r.alias);
+}
+
+async function getLinkWithAliases(db, slug) {
+  const row = await getLink(db, slug);
+  return row ? toPublicLink(row, await getAliases(db, row.slug)) : null;
+}
+
 async function getMaster(db) {
   const row = await db.prepare("SELECT value FROM settings WHERE key = 'master'").first();
   const fallback = { url: "", enabled: false };
@@ -152,9 +184,10 @@ async function getMaster(db) {
   }
 }
 
-function toPublicLink(row) {
+function toPublicLink(row, aliases = []) {
   return {
     slug: row.slug,
+    aliases,
     url: row.url,
     nickname: row.nickname || "",
     hasPassword: Boolean(row.pw_hash),
@@ -181,7 +214,7 @@ async function masterLink(env) {
 }
 
 async function followLink(request, env, ctx, slug) {
-  const link = await getLink(env.DB, slug);
+  const link = await resolveLink(env.DB, slug);
   if (!link || !link.enabled) return notFound();
   if (link.expires_at && link.expires_at <= Date.now()) {
     return htmlResponse(messagePage("Link expired", "This link is no longer available."), 410);
@@ -401,8 +434,19 @@ async function api(request, env, path) {
 
   if (parts[0] === "links" && parts.length === 1) {
     if (method === "GET") {
-      const { results } = await db.prepare("SELECT * FROM links ORDER BY created_at DESC").all();
-      return json({ links: results.map(toPublicLink) });
+      const [links, aliases] = await db.batch([
+        db.prepare("SELECT * FROM links ORDER BY created_at DESC"),
+        db.prepare("SELECT alias, slug FROM aliases ORDER BY alias"),
+      ]);
+      const bySlug = new Map();
+      for (const { alias, slug } of aliases.results) {
+        const key = slug.toLowerCase();
+        if (!bySlug.has(key)) bySlug.set(key, []);
+        bySlug.get(key).push(alias);
+      }
+      return json({
+        links: links.results.map((row) => toPublicLink(row, bySlug.get(row.slug.toLowerCase()) || [])),
+      });
     }
     if (method === "POST") return json(await createLink(db, await readJson(request), host), 201);
     return methodNotAllowed();
@@ -412,8 +456,12 @@ async function api(request, env, path) {
     const slug = parts[1];
     if (method === "PATCH") return json(await updateLink(db, slug, await readJson(request), host));
     if (method === "DELETE") {
-      const res = await db.prepare("DELETE FROM links WHERE slug = ?").bind(slug).run();
-      if (!res.meta.changes) throw new HttpError(404, "Link not found.");
+      const link = await getLink(db, slug);
+      if (!link) throw new HttpError(404, "Link not found.");
+      await db.batch([
+        db.prepare("DELETE FROM aliases WHERE slug = ?").bind(link.slug),
+        db.prepare("DELETE FROM links WHERE slug = ?").bind(link.slug),
+      ]);
       return json({ ok: true });
     }
     return methodNotAllowed();
@@ -438,7 +486,9 @@ async function readJson(request) {
   throw new HttpError(400, "Invalid JSON body.");
 }
 
-function normalizeUrl(input, host, ownPath) {
+// `ownCodes` are the slug and aliases of the link being saved ("" for the
+// master link), so a link can't redirect to itself.
+function normalizeUrl(input, host, ownCodes) {
   let value = String(input ?? "").trim();
   if (!value) throw new HttpError(400, "Destination URL is required.");
   if (!/^[a-z][a-z0-9+.-]*:/i.test(value)) value = "https://" + value;
@@ -452,22 +502,68 @@ function normalizeUrl(input, host, ownPath) {
     throw new HttpError(400, "Only http:// and https:// URLs are allowed.");
   }
   if (parsed.host.toLowerCase() === host.toLowerCase()) {
-    const p = (parsed.pathname.replace(/\/+$/, "") || "/").toLowerCase();
-    if (p === ownPath.toLowerCase()) throw new HttpError(400, "A link can't point to itself.");
+    let p = parsed.pathname;
+    try {
+      p = decodeURIComponent(p);
+    } catch {
+      // keep the raw path
+    }
+    p = p.replace(/\/+$/, "").slice(1).toLowerCase();
+    if (ownCodes.some((code) => code.toLowerCase() === p)) {
+      throw new HttpError(400, "A link can't point to itself.");
+    }
   }
   return parsed.href;
 }
 
-function validateSlug(input) {
+function validateSlug(input, label = "Short code") {
   const slug = String(input ?? "").trim();
   if (!SLUG_RE.test(slug)) {
     throw new HttpError(
       400,
-      "Short code must be 1–64 characters: letters, numbers, dashes or underscores (and can't start with a dash or underscore).",
+      `${label} "${slug}" isn't valid. Use 1–64 letters, numbers, dashes or underscores (not starting with a dash or underscore).`,
     );
   }
   if (RESERVED_SLUGS.has(slug.toLowerCase())) throw new HttpError(400, `"${slug}" is reserved.`);
   return slug;
+}
+
+const MAX_ALIASES = 20;
+
+// Accepts an array or a comma/space separated string. Returns unique aliases
+// (case-insensitive), silently dropping the link's own slug.
+function parseAliases(input, slug) {
+  const raw = Array.isArray(input) ? input : String(input ?? "").split(/[\s,]+/);
+  const seen = new Set();
+  const out = [];
+  for (const item of raw) {
+    const value = String(item ?? "").trim().replace(/^\/+/, "");
+    if (!value) continue;
+    const alias = validateSlug(value, "Alias");
+    const key = alias.toLowerCase();
+    if (key === slug.toLowerCase() || seen.has(key)) continue;
+    seen.add(key);
+    out.push(alias);
+  }
+  if (out.length > MAX_ALIASES) throw new HttpError(400, `A link can have at most ${MAX_ALIASES} aliases.`);
+  return out;
+}
+
+// Makes sure none of `codes` is already used as another link's slug or alias.
+// `ownSlug` is the link being saved (null when creating).
+async function assertCodesFree(db, codes, ownSlug) {
+  if (!codes.length) return;
+  const list = JSON.stringify(codes);
+  const [slugs, aliases] = await db.batch([
+    db
+      .prepare("SELECT slug AS code FROM links WHERE slug IN (SELECT value FROM json_each(?)) AND slug != ?")
+      .bind(list, ownSlug ?? ""),
+    db
+      .prepare("SELECT alias AS code FROM aliases WHERE alias IN (SELECT value FROM json_each(?)) AND slug != ?")
+      .bind(list, ownSlug ?? ""),
+  ]);
+  const taken = slugs.results[0] || aliases.results[0];
+  if (taken) throw new HttpError(409, `retrac.link/${taken.code} is already taken.`);
 }
 
 function cleanNickname(input) {
@@ -496,30 +592,34 @@ async function createLink(db, body, host) {
   } else {
     for (let i = 0; i < 8 && !slug; i++) {
       const candidate = randomSlug(i < 4 ? 6 : 8);
-      if (!(await getLink(db, candidate))) slug = candidate;
+      if (!(await resolveLink(db, candidate))) slug = candidate;
     }
     if (!slug) throw new HttpError(500, "Couldn't generate a short code. Try again.");
   }
 
-  const url = normalizeUrl(body.url, host, "/" + slug);
+  const aliases = parseAliases(body.aliases, slug);
+  await assertCodesFree(db, [slug, ...aliases], null);
+  const url = normalizeUrl(body.url, host, [slug, ...aliases]);
   const nickname = cleanNickname(body.nickname);
   const expiresAt = parseExpiry(body.expiresAt);
   const pw = body.password ? await hashPassword(validatePassword(body.password)) : null;
   const now = Date.now();
 
   try {
-    await db
-      .prepare(
-        `INSERT INTO links (slug, url, nickname, pw_hash, pw_salt, clicks, enabled, expires_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 0, 1, ?, ?, ?)`,
-      )
-      .bind(slug, url, nickname, pw?.hash ?? null, pw?.salt ?? null, expiresAt, now, now)
-      .run();
+    await db.batch([
+      db
+        .prepare(
+          `INSERT INTO links (slug, url, nickname, pw_hash, pw_salt, clicks, enabled, expires_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 0, 1, ?, ?, ?)`,
+        )
+        .bind(slug, url, nickname, pw?.hash ?? null, pw?.salt ?? null, expiresAt, now, now),
+      ...aliases.map((alias) => db.prepare("INSERT INTO aliases (alias, slug) VALUES (?, ?)").bind(alias, slug)),
+    ]);
   } catch (err) {
-    if (isUniqueViolation(err)) throw new HttpError(409, `retrac.link/${slug} is already taken.`);
+    if (isUniqueViolation(err)) throw new HttpError(409, "That short code or alias is already taken.");
     throw err;
   }
-  return toPublicLink(await getLink(db, slug));
+  return getLinkWithAliases(db, slug);
 }
 
 async function updateLink(db, slug, body, host) {
@@ -532,7 +632,13 @@ async function updateLink(db, slug, body, host) {
     newSlug = validateSlug(body.slug);
     if (newSlug !== link.slug) updates.slug = newSlug;
   }
-  if ("url" in body) updates.url = normalizeUrl(body.url, host, "/" + newSlug);
+  const replaceAliases = "aliases" in body;
+  const currentAliases = await getAliases(db, link.slug);
+  // Renaming a link to one of its own aliases promotes that alias.
+  const aliases = parseAliases(replaceAliases ? body.aliases : currentAliases, newSlug);
+  await assertCodesFree(db, [newSlug, ...aliases], link.slug);
+
+  if ("url" in body) updates.url = normalizeUrl(body.url, host, [newSlug, ...aliases]);
   if ("nickname" in body) updates.nickname = cleanNickname(body.nickname);
   if ("enabled" in body) updates.enabled = body.enabled ? 1 : 0;
   if ("expiresAt" in body) updates.expires_at = parseExpiry(body.expiresAt);
@@ -550,22 +656,26 @@ async function updateLink(db, slug, body, host) {
   // Column names come from the fixed keys above, never from user input.
   const cols = Object.keys(updates);
   try {
-    await db
-      .prepare(`UPDATE links SET ${cols.map((c) => `${c} = ?`).join(", ")} WHERE slug = ?`)
-      .bind(...cols.map((c) => updates[c]), link.slug)
-      .run();
+    // A batch runs as one transaction, so the link and its aliases stay in sync.
+    await db.batch([
+      db
+        .prepare(`UPDATE links SET ${cols.map((c) => `${c} = ?`).join(", ")} WHERE slug = ?`)
+        .bind(...cols.map((c) => updates[c]), link.slug),
+      db.prepare("DELETE FROM aliases WHERE slug = ?").bind(link.slug),
+      ...aliases.map((alias) => db.prepare("INSERT INTO aliases (alias, slug) VALUES (?, ?)").bind(alias, newSlug)),
+    ]);
   } catch (err) {
-    if (isUniqueViolation(err)) throw new HttpError(409, `retrac.link/${newSlug} is already taken.`);
+    if (isUniqueViolation(err)) throw new HttpError(409, "That short code or alias is already taken.");
     throw err;
   }
-  return toPublicLink(await getLink(db, newSlug));
+  return getLinkWithAliases(db, newSlug);
 }
 
 async function setMaster(db, body, host) {
   const enabled = Boolean(body.enabled);
   const raw = String(body.url ?? "").trim();
   if (enabled && !raw) throw new HttpError(400, "Enter a destination URL to turn on the master link.");
-  const url = raw ? normalizeUrl(raw, host, "/") : "";
+  const url = raw ? normalizeUrl(raw, host, [""]) : "";
   const value = JSON.stringify({ url, enabled });
   await db
     .prepare("INSERT INTO settings (key, value) VALUES ('master', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
@@ -846,6 +956,10 @@ details.more[open] summary { margin-bottom: 12px; }
 .link .short { color: var(--accent); text-decoration: none; font-weight: 600; word-break: break-all; }
 .link .short:hover { text-decoration: underline; }
 .link .nick { color: var(--text); }
+.hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+.link .aliases { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; font-size: 13px; color: var(--muted); align-items: center; }
+.link .aliases a { color: var(--accent); text-decoration: none; background: var(--accent-soft); padding: 1px 8px; border-radius: 999px; font-weight: 500; }
+.link .aliases a:hover { text-decoration: underline; }
 .link .dest { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
 .link .meta { color: var(--muted); font-size: 12px; margin-top: 4px; display: flex; gap: 12px; flex-wrap: wrap; }
 .link .btns { display: flex; gap: 4px; }
@@ -901,6 +1015,11 @@ function dashboardPage() {
       </div>
       <details class="more">
         <summary>More options</summary>
+        <div class="field">
+          <label for="c-aliases">Aliases (optional)</label>
+          <input type="text" id="c-aliases" placeholder="e.g. gh, git">
+          <p class="hint">Extra short codes that go to the same link. Separate with commas or spaces.</p>
+        </div>
         <div class="row two">
           <div class="field">
             <label for="c-pass">Password (optional)</label>
@@ -955,6 +1074,11 @@ function dashboardPage() {
         <label for="e-nick">Nickname</label>
         <input type="text" id="e-nick">
       </div>
+    </div>
+    <div class="field">
+      <label for="e-aliases">Aliases</label>
+      <input type="text" id="e-aliases" placeholder="None">
+      <p class="hint">Extra short codes that go to the same link. Separate with commas or spaces.</p>
     </div>
     <div class="row two">
       <div class="field">
@@ -1093,7 +1217,7 @@ function dashboardApp() {
     const list = $("#links");
     list.replaceChildren();
     const shown = links.filter(
-      (l) => !q || [l.slug, l.url, l.nickname].some((v) => v && v.toLowerCase().includes(q)),
+      (l) => !q || [l.slug, l.url, l.nickname, ...l.aliases].some((v) => v && v.toLowerCase().includes(q)),
     );
     $("#count").textContent = links.length ? `(${links.length})` : "";
     if (!links.length) {
@@ -1124,6 +1248,16 @@ function dashboardApp() {
               !link.enabled ? h("span", { class: "badge off" }, "Disabled") : null,
               expired ? h("span", { class: "badge exp" }, "Expired") : null,
             ),
+            link.aliases.length
+              ? h(
+                  "div",
+                  { class: "aliases" },
+                  "Also:",
+                  link.aliases.map((a) =>
+                    h("a", { href: location.origin + "/" + a, target: "_blank", rel: "noopener" }, "/" + a),
+                  ),
+                )
+              : null,
             h("div", { class: "dest", title: link.url }, "→ " + link.url),
             h(
               "div",
@@ -1180,6 +1314,7 @@ function dashboardApp() {
         url: $("#c-url").value,
         slug: $("#c-slug").value,
         nickname: $("#c-nick").value,
+        aliases: $("#c-aliases").value,
         password: $("#c-pass").value,
         expiresAt: fromLocalInput($("#c-exp").value),
       });
@@ -1209,6 +1344,7 @@ function dashboardApp() {
     $("#e-url").value = link.url;
     $("#e-slug").value = link.slug;
     $("#e-nick").value = link.nickname;
+    $("#e-aliases").value = link.aliases.join(", ");
     $("#e-pass").value = "";
     $("#e-pass").placeholder = link.hasPassword ? "Leave blank to keep current" : "No password";
     $("#e-pass-label").textContent = link.hasPassword ? "New password" : "Password";
@@ -1228,6 +1364,7 @@ function dashboardApp() {
         url: $("#e-url").value,
         slug: $("#e-slug").value,
         nickname: $("#e-nick").value,
+        aliases: $("#e-aliases").value,
         password: $("#e-remove-pass").checked ? "" : $("#e-pass").value,
         removePassword: $("#e-remove-pass").checked,
         expiresAt: fromLocalInput($("#e-exp").value),

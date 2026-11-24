@@ -7,6 +7,7 @@ Code that powers retrac.link 🔗 — a small link shortener running on Cloudfla
 - **Dashboard** at `retrac.link/dashboard`, protected by the `DASHBOARD_PASSWORD` secret
 - **Create links** with a custom short code (`retrac.link/yt`) or a random one
 - **Nicknames** so you can tell your links apart
+- **Aliases**: extra short codes for the same link (`retrac.link/github` and `retrac.link/gh`). Clicks on any alias count toward the main link.
 - **Password-protected links**: visitors have to enter a password before they're redirected (passwords are stored hashed with PBKDF2)
 - **Edit** a link's destination, short code, nickname, password, or expiry
 - **Disable**, **expire**, or **delete** links
@@ -57,6 +58,7 @@ npm run dev
 ## Notes
 
 - Reserved paths that can't be used as short codes: `dashboard`, `api`, `favicon.ico`, `robots.txt`.
-- Short codes are case-insensitive, so `retrac.link/YT` and `retrac.link/yt` are the same link.
+- Short codes and aliases are case-insensitive, so `retrac.link/YT` and `retrac.link/yt` are the same link.
+- A short code can't be used as both a link and an alias. If you change a link's short code to one of its own aliases, that alias becomes the main short code.
 - Redirects use HTTP 302, so when you change a link's destination, visitors get the new URL right away.
 - The dashboard doesn't rate-limit sign-in attempts, so use a long password. You can also add a Cloudflare rate-limiting rule on `POST /dashboard/login`.
