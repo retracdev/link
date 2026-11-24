@@ -992,7 +992,14 @@ function dashboardPage() {
 </dialog>
 
 <div class="toast-wrap" id="toasts"></div>`;
-  return layout("Dashboard · retrac.link", body, `(${dashboardApp.toString()})();`);
+  // Wrangler's bundler (esbuild with keepNames) injects `__name(fn, "name")`
+  // calls into every function, including this one. Those calls survive
+  // Function#toString, so define a no-op `__name` for the browser.
+  return layout(
+    "Dashboard · retrac.link",
+    body,
+    `var __name = (fn) => fn;\n(${dashboardApp.toString()})();`,
+  );
 }
 
 /**
