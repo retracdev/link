@@ -11,7 +11,7 @@ routes = [{ pattern = "retrac.link", custom_domain = true }]
 [[d1_databases]]
 binding = "DB"
 database_name = "retrac-link"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "32a5258b-4d81-4dff-8708-1adfc77d321b"
 
 # DASHBOARD_PASSWORD is a secret, not a var. Set it in the Cloudflare dashboard
 # (Workers & Pages → retrac-link → Settings → Variables and Secrets → Add → Secret)
