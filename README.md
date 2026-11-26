@@ -12,6 +12,7 @@ Code that powers retrac.link 🔗 — a small link shortener running on Cloudfla
 - **Edit** a link's destination, short code, nickname, password, or expiry
 - **Disable**, **expire**, or **delete** links
 - **Click counts** for every link
+- **QR codes**: click **QR** on any link to make a QR code. Customize dot and corner styles, colors, transparent backgrounds, a center logo (the site icon or your own image), error correction, and margin, then download a PNG or SVG or copy the image. QR codes point to `retrac.link/qr/<code>`, so scans show up as "from QR" next to the link's total clicks.
 - **Master link**: choose where `retrac.link` itself sends visitors
 
 ## Deploy
@@ -57,7 +58,9 @@ npm run dev
 
 ## Notes
 
-- Reserved paths that can't be used as short codes: `dashboard`, `api`, `favicon.ico`, `robots.txt`.
+- Reserved paths that can't be used as short codes: `dashboard`, `api`, `favicon.ico`, `robots.txt`. Paths under `/qr/` are used for QR code scans.
+- QR codes use a link's main short code. If you rename a link, QR codes you've already printed stop working, the same as the old short URL does.
+- QR settings are remembered in your browser. Uploaded logos aren't saved, so you'll need to pick the image again next time.
 - Short codes and aliases are case-insensitive, so `retrac.link/YT` and `retrac.link/yt` are the same link.
 - A short code can't be used as both a link and an alias. If you change a link's short code to one of its own aliases, that alias becomes the main short code.
 - Redirects use HTTP 302, so when you change a link's destination, visitors get the new URL right away.

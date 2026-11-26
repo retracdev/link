@@ -17,3 +17,9 @@ database_id = "32a5258b-4d81-4dff-8708-1adfc77d321b"
 # (Workers & Pages → retrac-link → Settings → Variables and Secrets → Add → Secret)
 # or with:  npx wrangler secret put DASHBOARD_PASSWORD
 # For local development, put it in a .dev.vars file (see .dev.vars.example).
+
+# Lets src/index.js import the favicon as an ArrayBuffer.
+[[rules]]
+type = "Data"
+globs = ["**/*.png"]
+fallthrough = true
