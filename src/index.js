@@ -7,10 +7,14 @@
  *
  * Routes:
  *   /                   Master link (redirects wherever you set it in the dashboard)
+ *   /qr/<slug>          Same as /<slug>, but the click is also counted as a QR scan
  *   /dashboard          Password-protected dashboard
  *   /api/*              JSON API used by the dashboard (session cookie required)
  *   /<slug>             Short link redirect (asks for a password if the link has one)
  */
+
+import { qrEncode } from "./qr.js";
+import FAVICON from "./favicon.png";
 
 const RESERVED_SLUGS = new Set(["dashboard", "api", "favicon.ico", "robots.txt"]);
 const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
@@ -63,8 +67,10 @@ async function route(request, env, ctx) {
   if (path === "/robots.txt") {
     return new Response("User-agent: *\nDisallow: /\n", { headers: { "Content-Type": "text/plain" } });
   }
-  if (path === "/favicon.ico") {
-    return new Response(null, { status: 204 });
+  if (path === "/favicon.ico" || path === "/favicon.png") {
+    return new Response(FAVICON, {
+      headers: { "Content-Type": "image/png", "Cache-Control": "public, max-age=86400" },
+    });
   }
 
   if (!env.DB) {
@@ -98,9 +104,13 @@ async function route(request, env, ctx) {
     return masterLink(env);
   }
 
+  // QR codes point at /qr/<slug> so scans can be counted separately.
+  const qr = path.match(/^\/qr\/([^/]+)$/);
+  if (qr) return followLink(request, env, ctx, qr[1], true);
+
   const slug = path.slice(1);
   if (slug.includes("/")) return notFound();
-  return followLink(request, env, ctx, slug);
+  return followLink(request, env, ctx, slug, false);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -137,6 +147,15 @@ function ensureSchema(db) {
         ),
         db.prepare(`CREATE INDEX IF NOT EXISTS aliases_slug ON aliases (slug)`),
       ])
+      // Added after launch, so existing databases need the column too.
+      .then(() =>
+        db
+          .prepare("ALTER TABLE links ADD COLUMN qr_clicks INTEGER NOT NULL DEFAULT 0")
+          .run()
+          .catch((err) => {
+            if (!/duplicate column/i.test(String(err && err.message))) throw err;
+          }),
+      )
       .catch((err) => {
         schemaReady = null;
         throw err;
@@ -192,6 +211,7 @@ function toPublicLink(row, aliases = []) {
     nickname: row.nickname || "",
     hasPassword: Boolean(row.pw_hash),
     clicks: row.clicks,
+    qrClicks: row.qr_clicks ?? 0,
     enabled: Boolean(row.enabled),
     expiresAt: row.expires_at ?? null,
     createdAt: row.created_at,
@@ -213,7 +233,7 @@ async function masterLink(env) {
   return htmlResponse(messagePage("retrac.link", "Short links live here."), 200);
 }
 
-async function followLink(request, env, ctx, slug) {
+async function followLink(request, env, ctx, slug, fromQr) {
   const link = await resolveLink(env.DB, slug);
   if (!link || !link.enabled) return notFound();
   if (link.expires_at && link.expires_at <= Date.now()) {
@@ -222,7 +242,13 @@ async function followLink(request, env, ctx, slug) {
 
   const countClick = () =>
     ctx.waitUntil(
-      env.DB.prepare("UPDATE links SET clicks = clicks + 1 WHERE slug = ?").bind(link.slug).run(),
+      env.DB.prepare(
+        fromQr
+          ? "UPDATE links SET clicks = clicks + 1, qr_clicks = qr_clicks + 1 WHERE slug = ?"
+          : "UPDATE links SET clicks = clicks + 1 WHERE slug = ?",
+      )
+        .bind(link.slug)
+        .run(),
     );
 
   if (!link.pw_hash) {
@@ -650,7 +676,10 @@ async function updateLink(db, slug, body, host) {
     updates.pw_hash = pw.hash;
     updates.pw_salt = pw.salt;
   }
-  if (body.resetClicks) updates.clicks = 0;
+  if (body.resetClicks) {
+    updates.clicks = 0;
+    updates.qr_clicks = 0;
+  }
   updates.updated_at = Date.now();
 
   // Column names come from the fixed keys above, never from user input.
@@ -851,6 +880,17 @@ button.ghost.danger-text:hover { color: var(--danger); background: var(--danger-
 .toggle input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: transform .15s; box-shadow: 0 1px 2px rgba(0,0,0,.2); }
 .toggle input:checked { background: var(--accent); }
 .toggle input:checked::after { transform: translateX(16px); }
+select {
+  width: 100%; font: inherit; color: var(--text); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; outline: none;
+}
+select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+select:disabled { opacity: .6; }
+input[type=color] {
+  width: 100%; height: 38px; padding: 3px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--surface); cursor: pointer;
+}
+input[type=range] { width: 100%; accent-color: var(--accent); margin: 8px 0 0; }
 .check { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 400; margin: 0; cursor: pointer; }
 `;
 
@@ -863,6 +903,7 @@ function layout(title, body, script = "") {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>${escapeHtml(title)}</title>
+<link rel="icon" type="image/png" href="/favicon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
@@ -980,6 +1021,22 @@ dialog {
 dialog::backdrop { background: rgba(10, 12, 16, .5); }
 dialog form { padding: 24px; margin: 0; }
 dialog h2 { font-size: 18px; margin-bottom: 16px; }
+dialog.wide { width: min(760px, calc(100vw - 32px)); }
+.qr-layout { display: grid; gap: 20px; grid-template-columns: 1fr; }
+@media (min-width: 680px) { .qr-layout { grid-template-columns: 260px minmax(0, 1fr); } }
+.qr-preview {
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; align-self: start;
+  background-color: var(--surface-2);
+  background-image: linear-gradient(45deg, var(--border) 25%, transparent 25%, transparent 75%, var(--border) 75%),
+    linear-gradient(45deg, var(--border) 25%, transparent 25%, transparent 75%, var(--border) 75%);
+  background-size: 16px 16px; background-position: 0 0, 8px 8px;
+}
+.qr-preview canvas { display: block; width: 100%; height: auto; max-width: 260px; margin: 0 auto; border-radius: 4px; }
+.qr-url { display: flex; align-items: center; gap: 6px; margin: 10px 0 0; font-size: 13px; }
+.qr-url code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.qr-controls .row.three { display: grid; gap: 12px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.qr-controls .field { margin-bottom: 12px; }
+.qr-controls label .val { color: var(--muted); font-weight: 400; }
 .toast-wrap { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 8px; z-index: 50; width: max-content; max-width: calc(100vw - 32px); }
 .toast { background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 10px; font-size: 14px; font-weight: 500; box-shadow: var(--shadow); animation: pop .18s ease-out; }
 .toast.err { background: var(--danger); color: #fff; }
@@ -1115,6 +1172,92 @@ function dashboardPage() {
   </form>
 </dialog>
 
+<dialog id="qr-dialog" class="wide">
+  <form method="dialog" autocomplete="off">
+    <h2>QR code</h2>
+    <div class="qr-layout">
+      <div>
+        <div class="qr-preview"><canvas id="qr-canvas" width="520" height="520"></canvas></div>
+        <div class="qr-url"><code id="qr-url"></code><button type="button" class="ghost" id="qr-copy-url">Copy</button></div>
+        <p class="hint">Scans go through <strong>/qr/</strong> so they're counted separately from regular clicks.</p>
+      </div>
+      <div class="qr-controls">
+        <div class="row two">
+          <div class="field">
+            <label for="qr-dots">Dot style</label>
+            <select id="qr-dots">
+              <option value="square">Square</option>
+              <option value="rounded">Rounded</option>
+              <option value="dots">Dots</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="qr-eyes">Corner style</label>
+            <select id="qr-eyes">
+              <option value="square">Square</option>
+              <option value="rounded">Rounded</option>
+              <option value="circle">Circle</option>
+            </select>
+          </div>
+        </div>
+        <div class="row three">
+          <div class="field"><label for="qr-fg">Dots</label><input type="color" id="qr-fg"></div>
+          <div class="field"><label for="qr-eye">Corners</label><input type="color" id="qr-eye"></div>
+          <div class="field"><label for="qr-bg">Background</label><input type="color" id="qr-bg"></div>
+        </div>
+        <div class="field">
+          <label class="check"><input type="checkbox" id="qr-transparent"> Transparent background</label>
+        </div>
+        <div class="row two">
+          <div class="field">
+            <label for="qr-logo">Center logo</label>
+            <select id="qr-logo">
+              <option value="none">None</option>
+              <option value="site">retrac.link icon</option>
+              <option value="custom">Upload image…</option>
+            </select>
+            <input type="file" id="qr-logo-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+          </div>
+          <div class="field">
+            <label for="qr-ecl">Error correction</label>
+            <select id="qr-ecl">
+              <option value="L">Low (7%)</option>
+              <option value="M">Medium (15%)</option>
+              <option value="Q">Quartile (25%)</option>
+              <option value="H">High (30%)</option>
+            </select>
+          </div>
+        </div>
+        <div class="row two">
+          <div class="field">
+            <label for="qr-margin">Margin <span class="val" id="qr-margin-val"></span></label>
+            <input type="range" id="qr-margin" min="0" max="8" step="1">
+          </div>
+          <div class="field">
+            <label for="qr-size">PNG size</label>
+            <select id="qr-size">
+              <option value="256">256 × 256</option>
+              <option value="512">512 × 512</option>
+              <option value="1024">1024 × 1024</option>
+              <option value="2048">2048 × 2048</option>
+            </select>
+          </div>
+        </div>
+        <p class="hint" id="qr-hint" style="margin:-4px 0 14px"></p>
+      </div>
+    </div>
+    <div class="actions" style="justify-content:space-between">
+      <button type="button" class="ghost" id="qr-reset">Reset style</button>
+      <div class="actions">
+        <button type="button" class="secondary" id="qr-close">Close</button>
+        <button type="button" class="secondary" id="qr-copy-img">Copy image</button>
+        <button type="button" class="secondary" id="qr-svg">SVG</button>
+        <button type="button" id="qr-png">Download PNG</button>
+      </div>
+    </div>
+  </form>
+</dialog>
+
 <div class="toast-wrap" id="toasts"></div>`;
   // Wrangler's bundler (esbuild with keepNames) injects `__name(fn, "name")`
   // calls into every function, including this one. Those calls survive
@@ -1122,15 +1265,16 @@ function dashboardPage() {
   return layout(
     "Dashboard · retrac.link",
     body,
-    `var __name = (fn) => fn;\n(${dashboardApp.toString()})();`,
+    `var __name = (fn) => fn;\n(${dashboardApp.toString()})(${qrEncode.toString()});`,
   );
 }
 
 /**
  * Client-side dashboard code. Serialized with Function#toString and inlined
  * into the page, so it must not reference anything outside its own body.
+ * `qrEncode` (from ./qr.js) is inlined the same way and passed in as `encodeQr`.
  */
-function dashboardApp() {
+function dashboardApp(encodeQr) {
   const $ = (sel) => document.querySelector(sel);
   const host = location.host;
   let links = [];
@@ -1263,6 +1407,7 @@ function dashboardApp() {
               "div",
               { class: "meta" },
               h("span", {}, `${link.clicks} click${link.clicks === 1 ? "" : "s"}`),
+              link.qrClicks ? h("span", {}, `${link.qrClicks} from QR`) : null,
               h("span", {}, "Created " + fmtDate(link.createdAt)),
               link.expiresAt && !expired ? h("span", {}, "Expires " + fmtDate(link.expiresAt)) : null,
             ),
@@ -1271,6 +1416,7 @@ function dashboardApp() {
             "div",
             { class: "btns" },
             h("button", { class: "ghost", type: "button", onclick: () => copy(shortUrl) }, "Copy"),
+            h("button", { class: "ghost", type: "button", onclick: () => openQr(link) }, "QR"),
             h("button", { class: "ghost", type: "button", onclick: () => openEdit(link) }, "Edit"),
             h("button", { class: "ghost danger-text", type: "button", onclick: () => openDelete(link) }, "Delete"),
           ),
@@ -1396,6 +1542,391 @@ function dashboardApp() {
       deleteDialog.close();
       render();
       toast("Link deleted");
+    });
+  });
+
+  // QR codes
+  const QR_DEFAULTS = {
+    dots: "square",
+    eyes: "square",
+    fg: "#0f1419",
+    eye: "#0f1419",
+    bg: "#ffffff",
+    transparent: false,
+    logo: "none",
+    ecl: "M",
+    margin: 4,
+    size: 1024,
+  };
+  const QR_STORE = "retrac-qr-style";
+  const QR_CHOICES = {
+    dots: ["square", "rounded", "dots"],
+    eyes: ["square", "rounded", "circle"],
+    logo: ["none", "site", "custom"],
+    ecl: ["L", "M", "Q", "H"],
+    size: [256, 512, 1024, 2048],
+  };
+  const qrDialog = $("#qr-dialog");
+  const qrLogos = { site: null, custom: null }; // { img, dataUrl }
+  let qrStyle = loadQrStyle();
+  let qrLink = null;
+  let qrRenderId = 0;
+
+  function cleanQrStyle(raw) {
+    const style = { ...QR_DEFAULTS };
+    const isColor = (v) => typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v);
+    for (const key of ["fg", "eye", "bg"]) if (isColor(raw[key])) style[key] = raw[key];
+    for (const [key, options] of Object.entries(QR_CHOICES)) if (options.includes(raw[key])) style[key] = raw[key];
+    const margin = Number(raw.margin);
+    if (Number.isInteger(margin) && margin >= 0 && margin <= 8) style.margin = margin;
+    style.transparent = raw.transparent === true;
+    return style;
+  }
+
+  function loadQrStyle() {
+    try {
+      return cleanQrStyle(JSON.parse(localStorage.getItem(QR_STORE)) || {});
+    } catch {
+      return { ...QR_DEFAULTS };
+    }
+  }
+
+  function saveQrStyle() {
+    try {
+      localStorage.setItem(QR_STORE, JSON.stringify(qrStyle));
+    } catch {
+      // Storage can be unavailable (private mode); the style just won't be remembered.
+    }
+  }
+
+  const qrUrl = (link) => location.origin + "/qr/" + encodeURIComponent(link.slug);
+
+  function syncQrControls() {
+    if (qrStyle.logo === "custom" && !qrLogos.custom) qrStyle.logo = "none";
+    $("#qr-dots").value = qrStyle.dots;
+    $("#qr-eyes").value = qrStyle.eyes;
+    $("#qr-fg").value = qrStyle.fg;
+    $("#qr-eye").value = qrStyle.eye;
+    $("#qr-bg").value = qrStyle.bg;
+    $("#qr-transparent").checked = qrStyle.transparent;
+    $("#qr-bg").disabled = qrStyle.transparent;
+    $("#qr-logo").value = qrStyle.logo;
+    // A logo covers part of the code, so it always uses the highest level.
+    $("#qr-ecl").value = qrStyle.logo === "none" ? qrStyle.ecl : "H";
+    $("#qr-ecl").disabled = qrStyle.logo !== "none";
+    $("#qr-margin").value = qrStyle.margin;
+    $("#qr-margin-val").textContent = `(${qrStyle.margin})`;
+    $("#qr-size").value = String(qrStyle.size);
+  }
+
+  function readQrControls() {
+    qrStyle = cleanQrStyle({
+      dots: $("#qr-dots").value,
+      eyes: $("#qr-eyes").value,
+      fg: $("#qr-fg").value,
+      eye: $("#qr-eye").value,
+      bg: $("#qr-bg").value,
+      transparent: $("#qr-transparent").checked,
+      logo: $("#qr-logo").value,
+      ecl: $("#qr-ecl").disabled ? qrStyle.ecl : $("#qr-ecl").value,
+      margin: Number($("#qr-margin").value),
+      size: Number($("#qr-size").value),
+    });
+  }
+
+  function readAsDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error("Couldn't read the image."));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("Couldn't load the image."));
+      img.src = src;
+    });
+  }
+
+  async function getQrLogo() {
+    if (qrStyle.logo === "custom") return qrLogos.custom;
+    if (qrStyle.logo !== "site") return null;
+    if (!qrLogos.site) {
+      const res = await fetch("/favicon.png");
+      if (!res.ok) throw new Error("Couldn't load the retrac.link icon.");
+      const dataUrl = await readAsDataUrl(await res.blob());
+      qrLogos.site = { img: await loadImage(dataUrl), dataUrl };
+    }
+    return qrLogos.site;
+  }
+
+  // Builds the code as SVG path data in module units (1 unit = 1 module).
+  function qrGeometry(text, style) {
+    const qr = encodeQr(text, style.logo === "none" ? style.ecl : "H");
+    const n = qr.size;
+    const m = style.margin;
+    const total = n + m * 2;
+
+    let logoBox = null;
+    let hidden = () => false;
+    if (style.logo !== "none") {
+      let span = Math.round(n * 0.24);
+      if ((n - span) % 2) span++;
+      const lo = (n - span) / 2;
+      logoBox = { x: lo + m, y: lo + m, size: span };
+      hidden = (x, y) => x >= lo && x < lo + span && y >= lo && y < lo + span;
+    }
+    const dark = (x, y) =>
+      x >= 0 && y >= 0 && x < n && y < n && qr.modules[y][x] && !qr.isFinder(x, y) && !hidden(x, y);
+
+    const f = (v) => +v.toFixed(3);
+    // Rounded rectangle; corner radii are given clockwise from the top left.
+    const rect = (x, y, w, h, tl = 0, tr = tl, br = tl, bl = tl) =>
+      `M${f(x + tl)} ${f(y)}H${f(x + w - tr)}` +
+      (tr ? `A${f(tr)} ${f(tr)} 0 0 1 ${f(x + w)} ${f(y + tr)}` : "") +
+      `V${f(y + h - br)}` +
+      (br ? `A${f(br)} ${f(br)} 0 0 1 ${f(x + w - br)} ${f(y + h)}` : "") +
+      `H${f(x + bl)}` +
+      (bl ? `A${f(bl)} ${f(bl)} 0 0 1 ${f(x)} ${f(y + h - bl)}` : "") +
+      `V${f(y + tl)}` +
+      (tl ? `A${f(tl)} ${f(tl)} 0 0 1 ${f(x + tl)} ${f(y)}` : "") +
+      "Z";
+    const circle = (cx, cy, r) =>
+      `M${f(cx - r)} ${f(cy)}A${f(r)} ${f(r)} 0 1 1 ${f(cx + r)} ${f(cy)}A${f(r)} ${f(r)} 0 1 1 ${f(cx - r)} ${f(cy)}Z`;
+
+    let dots = "";
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) {
+        if (!dark(x, y)) continue;
+        if (style.dots === "dots") {
+          dots += circle(x + m + 0.5, y + m + 0.5, 0.42);
+        } else if (style.dots === "rounded") {
+          // Round a corner only when neither neighbour on that corner is dark.
+          const up = dark(x, y - 1);
+          const down = dark(x, y + 1);
+          const left = dark(x - 1, y);
+          const right = dark(x + 1, y);
+          const r = 0.5;
+          dots += rect(
+            x + m, y + m, 1, 1,
+            !up && !left ? r : 0,
+            !up && !right ? r : 0,
+            !down && !right ? r : 0,
+            !down && !left ? r : 0,
+          );
+        } else {
+          // Merge horizontal runs into one rectangle.
+          let run = 1;
+          while (dark(x + run, y)) run++;
+          dots += rect(x + m, y + m, run, 1);
+          x += run - 1;
+        }
+      }
+    }
+
+    // Finder patterns ("eyes"), drawn with the even-odd rule so the ring has a hole.
+    let eyes = "";
+    for (const [ex, ey] of [[0, 0], [n - 7, 0], [0, n - 7]]) {
+      const x = ex + m;
+      const y = ey + m;
+      if (style.eyes === "circle") {
+        eyes += circle(x + 3.5, y + 3.5, 3.5) + circle(x + 3.5, y + 3.5, 2.5) + circle(x + 3.5, y + 3.5, 1.5);
+      } else {
+        const rounded = style.eyes === "rounded";
+        eyes += rect(x, y, 7, 7, rounded ? 2 : 0) + rect(x + 1, y + 1, 5, 5, rounded ? 1.2 : 0) + rect(x + 2, y + 2, 3, 3, rounded ? 0.9 : 0);
+      }
+    }
+
+    return { n, total, dots, eyes, logoBox };
+  }
+
+  // Fits the logo inside its box (keeping its aspect ratio).
+  function logoPlacement(geo, logo) {
+    const pad = 0.6;
+    const box = geo.logoBox;
+    const avail = box.size - pad * 2;
+    const ratio = logo.img.naturalWidth / logo.img.naturalHeight || 1;
+    const w = ratio >= 1 ? avail : avail * ratio;
+    const h = ratio >= 1 ? avail / ratio : avail;
+    return { x: box.x + (box.size - w) / 2, y: box.y + (box.size - h) / 2, w, h };
+  }
+
+  function drawQr(canvas, px, geo, style, logo) {
+    canvas.width = px;
+    canvas.height = px;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, px, px);
+    if (!style.transparent) {
+      ctx.fillStyle = style.bg;
+      ctx.fillRect(0, 0, px, px);
+    }
+    ctx.save();
+    ctx.scale(px / geo.total, px / geo.total);
+    ctx.fillStyle = style.fg;
+    ctx.fill(new Path2D(geo.dots));
+    ctx.fillStyle = style.eye;
+    ctx.fill(new Path2D(geo.eyes), "evenodd");
+    if (logo && geo.logoBox) {
+      const p = logoPlacement(geo, logo);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(logo.img, p.x, p.y, p.w, p.h);
+    }
+    ctx.restore();
+  }
+
+  function qrSvg(geo, style, logo) {
+    const t = geo.total;
+    let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${t} ${t}" width="${t * 10}" height="${t * 10}" shape-rendering="geometricPrecision">`;
+    if (!style.transparent) svg += `<rect width="${t}" height="${t}" fill="${style.bg}"/>`;
+    svg += `<path fill="${style.fg}" d="${geo.dots}"/>`;
+    svg += `<path fill="${style.eye}" fill-rule="evenodd" d="${geo.eyes}"/>`;
+    if (logo && geo.logoBox) {
+      const p = logoPlacement(geo, logo);
+      svg += `<image x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" preserveAspectRatio="xMidYMid meet" href="${logo.dataUrl}"/>`;
+    }
+    return svg + "</svg>";
+  }
+
+  function luminance(hex) {
+    const [r, g, b] = [1, 3, 5].map((i) => {
+      const c = parseInt(hex.slice(i, i + 2), 16) / 255;
+      return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  }
+
+  function qrHint(geo, style) {
+    const notes = [`${geo.n} × ${geo.n} modules.`];
+    if (style.logo !== "none") notes.push("High error correction is used so the code still scans under the logo.");
+    if (style.transparent) {
+      notes.push("Make sure the surface behind it contrasts with the dots.");
+    } else {
+      const fg = Math.min(luminance(style.fg), luminance(style.eye));
+      const bg = luminance(style.bg);
+      if (fg > bg) notes.push("Light dots on a dark background don't scan in every app.");
+      else if ((bg + 0.05) / (Math.max(luminance(style.fg), luminance(style.eye)) + 0.05) < 3)
+        notes.push("Low contrast: the code may be hard to scan.");
+    }
+    if (style.margin < 2) notes.push("A margin of at least 2 helps scanners find the code.");
+    return notes.join(" ");
+  }
+
+  async function renderQr() {
+    if (!qrLink) return;
+    const id = ++qrRenderId;
+    syncQrControls();
+    saveQrStyle();
+    const style = qrStyle;
+    let geo;
+    try {
+      geo = qrGeometry(qrUrl(qrLink), style);
+    } catch (err) {
+      $("#qr-hint").textContent = err.message;
+      return;
+    }
+    let logo = null;
+    try {
+      logo = await getQrLogo();
+    } catch (err) {
+      toast(err.message, true);
+    }
+    if (id !== qrRenderId) return;
+    drawQr($("#qr-canvas"), 520, geo, style, logo);
+    $("#qr-hint").textContent = qrHint(geo, style);
+  }
+
+  async function qrPngBlob() {
+    const canvas = document.createElement("canvas");
+    drawQr(canvas, qrStyle.size, qrGeometry(qrUrl(qrLink), qrStyle), qrStyle, await getQrLogo());
+    return new Promise((resolve, reject) =>
+      canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error("Couldn't create the image."))), "image/png"),
+    );
+  }
+
+  function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = h("a", { href: url, download: filename });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  const qrFilename = (ext) => `${host.replace(/[^a-z0-9.-]/gi, "-")}-${qrLink.slug}-qr.${ext}`;
+
+  function openQr(link) {
+    qrLink = link;
+    $("#qr-url").textContent = qrUrl(link).replace(/^https?:\/\//, "");
+    $("#qr-url").title = qrUrl(link);
+    qrDialog.showModal();
+    renderQr();
+  }
+
+  for (const id of ["#qr-dots", "#qr-eyes", "#qr-fg", "#qr-eye", "#qr-bg", "#qr-transparent", "#qr-ecl", "#qr-margin", "#qr-size"]) {
+    $(id).addEventListener("input", () => {
+      readQrControls();
+      renderQr();
+    });
+  }
+  $("#qr-logo").addEventListener("change", () => {
+    if ($("#qr-logo").value === "custom") {
+      // Keep the current choice until an image is actually picked.
+      $("#qr-logo").value = qrStyle.logo;
+      $("#qr-logo-file").value = "";
+      $("#qr-logo-file").click();
+      return;
+    }
+    readQrControls();
+    renderQr();
+  });
+  $("#qr-logo-file").addEventListener("change", async () => {
+    const file = $("#qr-logo-file").files[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) return toast("Choose an image file.", true);
+    if (file.size > 2 * 1024 * 1024) return toast("Logo images must be 2 MB or smaller.", true);
+    try {
+      const dataUrl = await readAsDataUrl(file);
+      qrLogos.custom = { img: await loadImage(dataUrl), dataUrl };
+      qrStyle.logo = "custom";
+      renderQr();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+  $("#qr-reset").addEventListener("click", () => {
+    qrStyle = { ...QR_DEFAULTS };
+    renderQr();
+  });
+  $("#qr-close").addEventListener("click", () => qrDialog.close());
+  qrDialog.addEventListener("close", () => {
+    qrLink = null;
+  });
+  $("#qr-copy-url").addEventListener("click", () => qrLink && copy(qrUrl(qrLink)));
+  $("#qr-png").addEventListener("click", () => {
+    if (!qrLink) return;
+    busy($("#qr-png"), async () => downloadBlob(await qrPngBlob(), qrFilename("png")));
+  });
+  $("#qr-svg").addEventListener("click", () => {
+    if (!qrLink) return;
+    busy($("#qr-svg"), async () => {
+      const svg = qrSvg(qrGeometry(qrUrl(qrLink), qrStyle), qrStyle, await getQrLogo());
+      downloadBlob(new Blob([svg], { type: "image/svg+xml" }), qrFilename("svg"));
+    });
+  });
+  $("#qr-copy-img").addEventListener("click", () => {
+    if (!qrLink) return;
+    busy($("#qr-copy-img"), async () => {
+      if (typeof ClipboardItem === "undefined" || !navigator.clipboard || !navigator.clipboard.write) {
+        throw new Error("Your browser can't copy images. Download it instead.");
+      }
+      // Passing the promise (not the blob) keeps Safari's user-gesture check happy.
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": qrPngBlob() })]);
+      toast("QR code copied");
     });
   });
 
